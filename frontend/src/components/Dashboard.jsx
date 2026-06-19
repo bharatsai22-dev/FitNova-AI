@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import Calendar from 'react-calendar';
+import emailjs from '@emailjs/browser';
 import 'react-calendar/dist/Calendar.css';
 import VirtualBuddy from './VirtualBuddy';
 import AIDietitian from './AIDietitian';
@@ -194,28 +195,41 @@ export default function Dashboard({
     setProgramStartDate(formatted);
   };
 
-  // Direct Communication Tunnel Dispatch Logic
+  // Direct Communication Tunnel Dispatch Logic (Using EmailJS)
   const handleDispatchFeedback = (e) => {
     e.preventDefault();
     if (!feedbackSubject || !feedbackMessage) return;
-
-    const adminEmail = "admin@bvsinc.com"; 
-    const emailSubject = encodeURIComponent(`[Platform ${feedbackType.toUpperCase()}] ${feedbackSubject}`);
-    const emailBody = encodeURIComponent(
-      `SYSTEM USER CONTEXT ID: ${userId || 'ANONYMOUS_RUNNER'}\n` +
-      `CLASSIFICATION VECTOR: ${feedbackType.toUpperCase()}\n` +
-      `TIMESTAMP: ${new Date().toISOString()}\n\n` +
-      `LOGGED MESSAGE:\n${feedbackMessage}`
-    );
-
-    window.location.href = `mailto:${adminEmail}?subject=${emailSubject}&body=${emailBody}`;
     
-    setIsDispatched(true);
-    setTimeout(() => {
-      setIsDispatched(false);
-      setFeedbackSubject('');
-      setFeedbackMessage('');
-    }, 4000);
+    // Data mapped to exactly match the {{email}} field in your EmailJS template layout
+    const templateParams = {
+      email: 'bharatsaikarre1359@gmail.com', // 🌟 FIXED: Changed from to_email to email to prevent empty recipient blocks
+      user_id: userId || 'ANONYMOUS_RUNNER',
+      feedback_type: feedbackType.toUpperCase(),
+      subject: feedbackSubject,
+      message: feedbackMessage,
+      timestamp: new Date().toISOString()
+    };
+    
+    // Fully configured EmailJS call
+    emailjs.send(
+      'service_cbnd5zi',      // Your Service ID
+      'template_n4o03gt',     // Your Template ID
+      templateParams,
+      'jyy-2mPTCkN6p5nAB'     // Your Public Key
+    )
+    .then((response) => {
+      console.log('Email successfully dispatched!', response.status, response.text);
+      setIsDispatched(true);
+      setTimeout(() => {
+        setIsDispatched(false);
+        setFeedbackSubject('');
+        setFeedbackMessage('');
+      }, 4000);
+    })
+    .catch((error) => {
+      console.error('FAILED to dispatch email.', error);
+      alert(`⚠️ Transmission Interrupted!\nReason: ${error.text || 'Check console log markers.'}`);
+    });
   };
 
   // ── RUNTIME INFERENCE PASS — fed from shared sync props
@@ -524,8 +538,8 @@ export default function Dashboard({
               {isDispatched ? (
                 <div className="bg-[#32CD32]/10 border border-[#32CD32]/30 rounded-xl p-6 text-center space-y-2 animate-pulse">
                   <CheckCircle2 size={32} className="text-[#32CD32] mx-auto" />
-                  <h4 className="text-xs font-black uppercase tracking-widest text-white">Transmission Initiated</h4>
-                  <p className="text-[11px] text-stone-400">Opening system mail client. Packet routing directly to admin terminal...</p>
+                  <h4 className="text-xs font-black uppercase tracking-widest text-white">Transmission Successful</h4>
+                  <p className="text-[11px] text-stone-400">Feedback dispatched via EmailJS. Packet delivered directly to admin terminal.</p>
                 </div>
               ) : (
                 <form onSubmit={handleDispatchFeedback} className="space-y-4">

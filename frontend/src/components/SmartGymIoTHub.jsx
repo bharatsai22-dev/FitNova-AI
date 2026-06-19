@@ -203,6 +203,48 @@ function Badge({ children, variant = 'idle', style = {} }) {
   );
 }
 
+function SlideSwitcher({ activeSlide, onChange, onBackToDashboard }) {
+  const slides = [
+    { id: 'wearable', icon: 'ti-bluetooth', label: 'Wearable Health Hub' },
+    { id: 'iot',      icon: 'ti-router',    label: 'MQTT IoT Simulator' },
+  ];
+  return (
+    <div style={{ display:'flex', alignItems:'center', gap:10, marginBottom:'1.25rem', flexWrap:'wrap' }}>
+      {onBackToDashboard && (
+        <button onClick={onBackToDashboard} style={{ background:'var(--color-background-secondary)', border:'0.5px solid var(--color-border-tertiary)', borderRadius:'var(--border-radius-md)', padding:'6px 8px', cursor:'pointer', color:'var(--color-text-secondary)', display:'flex', alignItems:'center', flexShrink:0 }}>
+          <i className="ti ti-chevron-left" aria-hidden="true" />
+        </button>
+      )}
+      <div role="tablist" aria-label="Smart Gym IoT Hub slides" style={{ display:'inline-flex', background:'var(--color-background-secondary)', border:'0.5px solid var(--color-border-tertiary)', borderRadius:'var(--border-radius-md)', padding:3, gap:2 }}>
+        {slides.map(s => {
+          const active = activeSlide === s.id;
+          return (
+            <button
+              key={s.id}
+              role="tab"
+              aria-selected={active}
+              onClick={() => onChange(s.id)}
+              style={{
+                display:'flex', alignItems:'center', gap:7,
+                padding:'7px 14px', borderRadius:'calc(var(--border-radius-md) - 2px)',
+                border:'none', cursor:'pointer',
+                fontSize:13, fontWeight:500, letterSpacing:'0.01em',
+                background: active ? 'var(--color-background-primary)' : 'transparent',
+                color: active ? 'var(--color-text-primary)' : 'var(--color-text-secondary)',
+                boxShadow: active ? '0 0 0 0.5px var(--color-border-secondary)' : 'none',
+                transition:'all 0.15s',
+              }}
+            >
+              <i className={`ti ${s.icon}`} aria-hidden="true" />
+              {s.label}
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 function EcgCanvas({ ecgHistory }) {
   const canvasRef = useRef(null);
 
@@ -210,8 +252,16 @@ function EcgCanvas({ ecgHistory }) {
     const canvas = canvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext('2d');
+
+    // CSS (logical) size stays in pixels-on-screen; backing buffer is scaled
+    // up by devicePixelRatio so grid lines and the waveform stay crisp on
+    // Retina phones/tablets/laptops instead of looking blurry/soft.
+    const dpr = window.devicePixelRatio || 1;
     const w = canvas.offsetWidth || 320, h = canvas.offsetHeight || 72;
-    canvas.width = w; canvas.height = h;
+    canvas.width = Math.round(w * dpr);
+    canvas.height = Math.round(h * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0); // draw in CSS-pixel coordinates from here on
+
     ctx.clearRect(0, 0, w, h);
     const isDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
     ctx.strokeStyle = isDark ? 'rgba(255,255,255,0.05)' : 'rgba(0,0,0,0.05)';
@@ -290,6 +340,9 @@ function SleepStageBar() {
 
 // ─── MAIN COMPONENT ──────────────────────────────────────────────────────────
 export default function SmartGymIoTHub({ onBackToDashboard }) {
+  // ─── SLIDE NAVIGATION (Wearable Hub ↔ MQTT IoT Simulator) ────────────────
+  const [activeSlide, setActiveSlide] = useState('wearable'); // 'wearable' | 'iot'
+
   const [device, setDevice] = useState(null);
   const [isConnected, setIsConnected] = useState(false);
   const [isConnecting, setIsConnecting] = useState(false);
@@ -314,6 +367,9 @@ export default function SmartGymIoTHub({ onBackToDashboard }) {
   const sessionTimer = useRef(null);
   const startTimeRef = useRef(null);
   const activeChars = useRef([]);
+  const bpmRef = useRef(72);          // mutable ref so the ECG loop reads live bpm without re-mounting its interval
+  const deviceRef = useRef(null);     // mirrors `device` so the unmount cleanup can reach the live BLE device
+  const isMountedRef = useRef(true);  // guards against state updates firing after unmount
 
   const bpm = hrData.bpm;
   const hrv = hrData.hrv;
@@ -323,18 +379,25 @@ export default function SmartGymIoTHub({ onBackToDashboard }) {
   const vo2Max = (bpm && restHr) ? calcVO2Max(185, restHr) : null;
   const recoveryScore = hrv ? calcRecovery(hrv) : null;
 
+  // Keep mutable refs in sync with the latest state, without retriggering timers
+  useEffect(() => { bpmRef.current = bpm || 72; }, [bpm]);
+  useEffect(() => { deviceRef.current = device; }, [device]);
+
   // ─── ECG ANIMATION ──────────────────────────────────────────────────────
+  // Mounts the interval ONCE per connection (not on every bpm tick). The loop
+  // reads bpmRef.current each frame, so heart-rate changes animate smoothly
+  // instead of tearing down/recreating the interval every second.
   useEffect(() => {
     if (!isConnected) return;
     ecgTimer.current = setInterval(() => {
       setEcgHistory(prev => {
         const next = [...prev.slice(1)];
-        next.push(Math.round(ecgPoint(bpm || 72)));
+        next.push(Math.round(ecgPoint(bpmRef.current)));
         return next;
       });
     }, 85);
     return () => clearInterval(ecgTimer.current);
-  }, [isConnected, bpm]);
+  }, [isConnected]);
 
   // ─── SESSION TIMER ───────────────────────────────────────────────────────
   useEffect(() => {
@@ -347,6 +410,9 @@ export default function SmartGymIoTHub({ onBackToDashboard }) {
   }, [isConnected]);
 
   // ─── DISCONNECT HANDLER ──────────────────────────────────────────────────
+  // Tears down BLE listeners + all timers. Guarded by isMountedRef so it's
+  // also safe to call from the unmount cleanup effect below without causing
+  // "Cannot update state on an unmounted component" warnings/leaks.
   const handleDisconnection = useCallback(() => {
     activeChars.current.forEach(({ chr, handler }) => {
       try { chr.removeEventListener('characteristicvaluechanged', handler); } catch {}
@@ -355,6 +421,7 @@ export default function SmartGymIoTHub({ onBackToDashboard }) {
     clearInterval(simTimer.current);
     clearInterval(ecgTimer.current);
     clearInterval(sessionTimer.current);
+    if (!isMountedRef.current) return;
     setIsConnected(false); setDevice(null);
     setConnectedServices([]); setBatteryLevel(null);
     setHrData({ bpm: null, hrv: null, rrIntervals: [] });
@@ -363,6 +430,33 @@ export default function SmartGymIoTHub({ onBackToDashboard }) {
     setBpData({ systolic: null, diastolic: null });
     setSteps(null); setCaloriesBurned(null); setTemperature(null);
     setEcgHistory(new Array(80).fill(50));
+  }, []);
+
+  // ─── UNMOUNT & LEAK PROTECTION ───────────────────────────────────────────
+  // Runs once on mount, cleans up once on unmount (e.g. navigating away from
+  // this slide/page). Gracefully disconnects any live BLE GATT connection and
+  // destroys every background timer (sim engine, ECG loop, session clock) so
+  // nothing keeps running or leaking after the component is gone.
+  useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+      try {
+        const liveDevice = deviceRef.current;
+        if (liveDevice?.gatt?.connected) {
+          liveDevice.removeEventListener('gattserverdisconnected', handleDisconnection);
+          liveDevice.gatt.disconnect();
+        }
+      } catch {}
+      activeChars.current.forEach(({ chr, handler }) => {
+        try { chr.removeEventListener('characteristicvaluechanged', handler); } catch {}
+      });
+      activeChars.current = [];
+      clearInterval(simTimer.current);
+      clearInterval(ecgTimer.current);
+      clearInterval(sessionTimer.current);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // ─── BLE HELPERS ─────────────────────────────────────────────────────────
@@ -399,6 +493,7 @@ export default function SmartGymIoTHub({ onBackToDashboard }) {
     setSteps(simSteps); setCaloriesBurned(simCals);
 
     simTimer.current = setInterval(() => {
+      if (!isMountedRef.current) return;
       if (!hasHr) {
         simHr = Math.max(55, Math.min(185, simHr + (Math.random() > 0.5 ? 1 : -1) * Math.ceil(Math.random() * 2)));
         simHrv = Math.max(20, Math.min(100, simHrv + (Math.random() > 0.5 ? 1 : -1)));
@@ -426,6 +521,15 @@ export default function SmartGymIoTHub({ onBackToDashboard }) {
     try {
       const bleDevice = await navigator.bluetooth.requestDevice({ acceptAllDevices: true, optionalServices: allOptional });
       const gattServer = await bleDevice.gatt.connect();
+
+      // The component may have unmounted while the picker/connect promise was
+      // pending. If so, disconnect immediately and skip wiring up any state,
+      // listeners, or timers — nothing here should outlive the component.
+      if (!isMountedRef.current) {
+        try { gattServer.disconnect(); } catch {}
+        return;
+      }
+
       setDevice(bleDevice); setDeviceName(bleDevice.name || 'Unknown device');
       bleDevice.addEventListener('gattserverdisconnected', handleDisconnection);
 
@@ -445,11 +549,12 @@ export default function SmartGymIoTHub({ onBackToDashboard }) {
         const allSvcs = await gattServer.getPrimaryServices();
         for (const s of allSvcs) if (serviceNames[s.uuid]) discovered.push(serviceNames[s.uuid]);
       } catch {}
+      if (!isMountedRef.current) { try { gattServer.disconnect(); } catch {} return; }
       setConnectedServices(discovered);
 
       // Battery
       const battDv = await tryRead(gattServer, GATT.SERVICES.BATTERY, GATT.CHARACTERISTICS.BATTERY_LEVEL);
-      if (battDv) setBatteryLevel(battDv.getUint8(0));
+      if (battDv && isMountedRef.current) setBatteryLevel(battDv.getUint8(0));
 
       // Subscribe to live characteristics
       await trySubscribe(gattServer, GATT.SERVICES.HEART_RATE, GATT.CHARACTERISTICS.HR_MEASUREMENT, e => setHrData(parsers.heartRate(e.target.value)));
@@ -459,16 +564,25 @@ export default function SmartGymIoTHub({ onBackToDashboard }) {
       await trySubscribe(gattServer, GATT.SERVICES.BLOOD_PRESSURE, GATT.CHARACTERISTICS.BP_MEASUREMENT, e => setBpData(parsers.bloodPressure(e.target.value)));
       await trySubscribe(gattServer, GATT.SERVICES.HEALTH_THERMOMETER, GATT.CHARACTERISTICS.TEMPERATURE_MEASUREMENT, e => setTemperature(parsers.temperature(e.target.value).celsius));
 
+      if (!isMountedRef.current) {
+        // Unmounted mid-subscription setup — tear everything back down instead of starting sim/state on a dead component.
+        try { gattServer.disconnect(); } catch {}
+        activeChars.current.forEach(({ chr, handler }) => { try { chr.removeEventListener('characteristicvaluechanged', handler); } catch {} });
+        activeChars.current = [];
+        return;
+      }
+
       setIsConnected(true);
       startSim(discovered);
     } catch (err) {
+      if (!isMountedRef.current) return;
       let msg = err.message || 'Unknown error.';
       if (err.name === 'NotFoundError') msg = 'No device selected. Open the picker and choose your wearable.';
       else if (err.name === 'SecurityError') msg = 'Bluetooth permission denied. Allow Bluetooth in site settings.';
       else if (err.name === 'NetworkError') msg = 'GATT connection failed. Make sure the device is powered on and not connected elsewhere.';
       setBleError(msg);
     } finally {
-      setIsConnecting(false);
+      if (isMountedRef.current) setIsConnecting(false);
     }
   };
 
@@ -673,16 +787,16 @@ export default function SmartGymIoTHub({ onBackToDashboard }) {
         @keyframes spin   { from{transform:rotate(0deg)} to{transform:rotate(360deg)} }
       `}</style>
       <div style={{ fontFamily:'var(--font-sans)', padding:'1.5rem', background:'var(--color-background-primary)' }}>
-        <h2 className="sr-only">Smart Gym IoT Hub — real-time BLE biometric dashboard</h2>
+        <h2 className="sr-only">Smart Gym IoT Hub — real-time BLE biometric dashboard and MQTT device simulator</h2>
 
+        {/* Slide switcher */}
+        <SlideSwitcher activeSlide={activeSlide} onChange={setActiveSlide} onBackToDashboard={onBackToDashboard} />
+
+        {activeSlide === 'wearable' ? (
+        <>
         {/* Header */}
         <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', paddingBottom:'1.25rem', borderBottom:'0.5px solid var(--color-border-tertiary)', marginBottom:'1.5rem', gap:12, flexWrap:'wrap' }}>
           <div style={{ display:'flex', alignItems:'center', gap:10 }}>
-            {onBackToDashboard && (
-              <button onClick={onBackToDashboard} style={{ background:'var(--color-background-secondary)', border:'0.5px solid var(--color-border-tertiary)', borderRadius:'var(--border-radius-md)', padding:'6px 8px', cursor:'pointer', color:'var(--color-text-secondary)', display:'flex', alignItems:'center' }}>
-                <i className="ti ti-chevron-left" aria-hidden="true" />
-              </button>
-            )}
             <div style={{ width:10, height:10, borderRadius:'50%', background: isConnected ? '#1a7a4a' : '#888', animation: isConnected ? 'pulse 1.4s infinite' : 'none', flexShrink:0 }} aria-hidden="true" />
             <div>
               <div style={{ fontSize:17, fontWeight:500, color:'var(--color-text-primary)', display:'flex', alignItems:'center', gap:6 }}>
@@ -763,12 +877,221 @@ export default function SmartGymIoTHub({ onBackToDashboard }) {
         <div style={{ marginTop:'1rem', textAlign:'center', fontSize:12, color:'var(--color-text-secondary)', paddingTop:'0.75rem', borderTop:'0.5px solid var(--color-border-tertiary)' }}>
           Compatible with <strong>Garmin · Polar · Wahoo · Fitbit · Samsung Galaxy Watch · Withings · Omron · Beurer</strong> · Any GATT 1.0+ BLE device
         </div>
+        </>
+        ) : (
+          <MqttIoTSimulator />
+        )}
       </div>
     </>
   );
 }
 
-// ─── SHARED STYLES ───────────────────────────────────────────────────────────
+// ─── HARDWARE CONNECTABLES CATALOG ─────────────────────────────────────────
+// Simulated gym-floor IoT devices a real MQTT broker deployment would expose.
+const IOT_DEVICES = [
+  { id: 'esp32-rep-01',   name: 'ESP32 Rep Counter',        icon: 'ti-cpu',            topic: 'gym/station-3/reps',        unit: 'reps',  protocol: 'MQTT · QoS 1', gen: () => Math.floor(Math.random() * 3) },
+  { id: 'treadmill-04',   name: 'Smart Treadmill Controller', icon: 'ti-run',          topic: 'gym/cardio/treadmill-04',    unit: 'km/h',  protocol: 'MQTT · QoS 1', gen: () => (8 + Math.random() * 6).toFixed(1) },
+  { id: 'plug-rack-b',    name: 'Smart Plug — Rack B',       icon: 'ti-plug',          topic: 'gym/power/rack-b',           unit: 'W',     protocol: 'MQTT · QoS 0', gen: () => Math.floor(40 + Math.random() * 220) },
+  { id: 'beacon-zone-2',  name: 'BLE Beacon — Zone 2',       icon: 'ti-broadcast',     topic: 'gym/zones/zone-2/occupancy', unit: 'people',protocol: 'BLE → MQTT bridge', gen: () => Math.floor(Math.random() * 9) },
+  { id: 'scale-01',       name: 'Smart Body Scale',          icon: 'ti-scale',         topic: 'gym/checkin/scale-01',       unit: 'kg',    protocol: 'MQTT · QoS 1', gen: () => (55 + Math.random() * 40).toFixed(1) },
+  { id: 'locker-sensor',  name: 'Locker Door Sensor',        icon: 'ti-lock',          topic: 'gym/lockers/row-c/status',   unit: '',      protocol: 'MQTT · QoS 2', gen: () => (Math.random() > 0.5 ? 'OPEN' : 'CLOSED') },
+  { id: 'air-quality',    name: 'Ambient Air Quality Sensor',icon: 'ti-wind',          topic: 'gym/env/air-quality',        unit: 'AQI',   protocol: 'MQTT · QoS 0', gen: () => Math.floor(20 + Math.random() * 35) },
+  { id: 'water-dispenser',name: 'Smart Water Dispenser',     icon: 'ti-droplet',       topic: 'gym/amenities/water-01',     unit: '% full',protocol: 'MQTT · QoS 0', gen: () => Math.floor(10 + Math.random() * 90) },
+];
+
+function MqttIoTSimulator() {
+  const [brokerStatus, setBrokerStatus] = useState('disconnected'); // 'disconnected' | 'connecting' | 'connected'
+  const [connectedDevices, setConnectedDevices] = useState({});     // { [deviceId]: true }
+  const [messages, setMessages] = useState([]);                     // live log, newest first
+  const [clientId] = useState(() => `fitnova-client-${Math.random().toString(16).slice(2, 8)}`);
+
+  const publishTimers = useRef({});   // { [deviceId]: intervalId }
+  const isMountedRef = useRef(true);
+  const msgIdRef = useRef(0);
+
+  // ─── UNMOUNT & LEAK PROTECTION ─────────────────────────────────────────
+  // Mirrors the protection on the Wearable Hub slide: tearing down every
+  // per-device publish interval and marking unmounted so no late timer
+  // tick can call setState after this slide is switched away from / unmounted.
+  useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+      Object.values(publishTimers.current).forEach(clearInterval);
+      publishTimers.current = {};
+    };
+  }, []);
+
+  const pushMessage = useCallback((device, payload) => {
+    if (!isMountedRef.current) return;
+    msgIdRef.current += 1;
+    setMessages(prev => {
+      const next = [{ id: msgIdRef.current, deviceId: device.id, deviceName: device.name, topic: device.topic, payload, ts: Date.now() }, ...prev];
+      return next.slice(0, 40); // cap log length so it never grows unbounded
+    });
+  }, []);
+
+  const connectBroker = () => {
+    setBrokerStatus('connecting');
+    setTimeout(() => {
+      if (!isMountedRef.current) return;
+      setBrokerStatus('connected');
+    }, 900);
+  };
+
+  const disconnectBroker = useCallback(() => {
+    Object.values(publishTimers.current).forEach(clearInterval);
+    publishTimers.current = {};
+    if (!isMountedRef.current) return;
+    setBrokerStatus('disconnected');
+    setConnectedDevices({});
+  }, []);
+
+  const toggleDevice = (device) => {
+    const isOn = !!connectedDevices[device.id];
+    if (isOn) {
+      clearInterval(publishTimers.current[device.id]);
+      delete publishTimers.current[device.id];
+      setConnectedDevices(prev => { const next = { ...prev }; delete next[device.id]; return next; });
+      return;
+    }
+    setConnectedDevices(prev => ({ ...prev, [device.id]: true }));
+    pushMessage(device, device.gen()); // initial reading immediately
+    const intervalMs = 1400 + Math.random() * 1200;
+    publishTimers.current[device.id] = setInterval(() => {
+      if (!isMountedRef.current) { clearInterval(publishTimers.current[device.id]); return; }
+      pushMessage(device, device.gen());
+    }, intervalMs);
+  };
+
+  const subscribedCount = Object.keys(connectedDevices).length;
+  const isConnected = brokerStatus === 'connected';
+
+  return (
+    <div>
+      {/* Broker status header */}
+      <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', paddingBottom:'1.25rem', borderBottom:'0.5px solid var(--color-border-tertiary)', marginBottom:'1.5rem', gap:12, flexWrap:'wrap' }}>
+        <div style={{ display:'flex', alignItems:'center', gap:10 }}>
+          <div style={{ width:10, height:10, borderRadius:'50%', background: isConnected ? '#1a7a4a' : brokerStatus === 'connecting' ? '#D4A017' : '#888', animation: isConnected || brokerStatus === 'connecting' ? 'pulse 1.4s infinite' : 'none', flexShrink:0 }} aria-hidden="true" />
+          <div>
+            <div style={{ fontSize:17, fontWeight:500, color:'var(--color-text-primary)', display:'flex', alignItems:'center', gap:6 }}>
+              <i className="ti ti-router" aria-hidden="true" />AI-Driven IoT Device Simulator
+            </div>
+            <div style={{ fontSize:12, color:'var(--color-text-secondary)', marginTop:2 }}>
+              {isConnected ? `Simulated MQTT broker · ${subscribedCount} device${subscribedCount === 1 ? '' : 's'} publishing` : 'In-browser broker simulation — no real network traffic'}
+            </div>
+          </div>
+        </div>
+        <div style={{ display:'flex', alignItems:'center', gap:8, flexWrap:'wrap' }}>
+          <Badge variant={isConnected ? 'connected' : 'idle'}>
+            <i className={`ti ${isConnected ? 'ti-wifi' : 'ti-wifi-off'}`} aria-hidden="true" />
+            {brokerStatus === 'connecting' ? 'Connecting…' : isConnected ? 'Broker connected' : 'Broker offline'}
+          </Badge>
+          {!isConnected ? (
+            <button onClick={connectBroker} disabled={brokerStatus === 'connecting'} style={{ cursor: brokerStatus === 'connecting' ? 'not-allowed' : 'pointer', background:'#1a5fa8', border:'none', borderRadius:'var(--border-radius-md)', color:'#fff', fontSize:13, fontWeight:500, padding:'7px 16px', display:'inline-flex', alignItems:'center', gap:6, opacity: brokerStatus === 'connecting' ? 0.7 : 1 }}>
+              <i className={`ti ${brokerStatus === 'connecting' ? 'ti-loader-2' : 'ti-plug'}`} aria-hidden="true" style={{ animation: brokerStatus === 'connecting' ? 'spin 0.8s linear infinite' : 'none' }} />
+              {brokerStatus === 'connecting' ? 'Connecting…' : 'Connect Broker'}
+            </button>
+          ) : (
+            <button onClick={disconnectBroker} style={{ cursor:'pointer', background:'transparent', border:'0.5px solid #c0392b', borderRadius:'var(--border-radius-md)', color:'#c0392b', fontSize:13, fontWeight:500, padding:'7px 14px', display:'inline-flex', alignItems:'center', gap:6 }}>
+              <i className="ti ti-link-off" aria-hidden="true" />Disconnect
+            </button>
+          )}
+        </div>
+      </div>
+
+      {/* Connection info strip */}
+      {isConnected && (
+        <div style={{ background:'var(--color-background-secondary)', borderRadius:'var(--border-radius-md)', padding:'0.625rem 0.875rem', display:'flex', flexWrap:'wrap', gap:12, marginBottom:'1rem', fontFamily:'monospace' }}>
+          <span style={{ fontSize:12, color:'var(--color-text-secondary)' }}>Client ID: <strong style={{ color:'var(--color-text-primary)' }}>{clientId}</strong></span>
+          <span style={{ fontSize:12, color:'var(--color-text-secondary)' }}>Broker: <strong style={{ color:'var(--color-text-primary)' }}>mqtt://sim.local:1883</strong></span>
+          <span style={{ fontSize:12, color:'var(--color-text-secondary)' }}>Subscriptions: <strong style={{ color:'var(--color-text-primary)' }}>{subscribedCount}</strong></span>
+        </div>
+      )}
+
+      {/* Idle state */}
+      {!isConnected && (
+        <div style={{ background:'var(--color-background-secondary)', borderRadius:'var(--border-radius-lg)', padding:'2.5rem', textAlign:'center', border:'0.5px solid var(--color-border-tertiary)', marginBottom:'1.5rem' }}>
+          <i className="ti ti-router" aria-hidden="true" style={{ fontSize:40, color:'var(--color-text-secondary)', display:'block', marginBottom:'1rem' }} />
+          <div style={{ fontSize:15, fontWeight:500, color:'var(--color-text-primary)', marginBottom:8 }}>Broker not connected</div>
+          <div style={{ fontSize:13, color:'var(--color-text-secondary)', lineHeight:1.6, maxWidth:420, margin:'0 auto 1.25rem' }}>
+            Tap <strong>Connect Broker</strong> to start the simulation. Each connectable below publishes synthetic readings on its own MQTT topic at a randomized interval, just like a real gym-floor sensor fleet would.
+          </div>
+        </div>
+      )}
+
+      {/* Main grid: device catalog + live message log */}
+      <div style={{ display:'grid', gridTemplateColumns:'1.1fr 1fr', gap:'1rem', opacity: isConnected ? 1 : 0.35, pointerEvents: isConnected ? 'auto' : 'none', transition:'opacity 0.4s' }}>
+        {/* Hardware connectables panel */}
+        <div style={panelStyle}>
+          <PanelHeader icon="ti-devices" label="Hardware connectables" colorClass={{ background:'#eeedfe', color:'#3C3489' }} />
+          <div style={sectionLabel}>Tap a device to subscribe / publish</div>
+          <div style={{ display:'flex', flexDirection:'column', gap:8 }}>
+            {IOT_DEVICES.map(device => {
+              const on = !!connectedDevices[device.id];
+              return (
+                <button
+                  key={device.id}
+                  onClick={() => toggleDevice(device)}
+                  style={{
+                    display:'flex', alignItems:'center', gap:10, textAlign:'left',
+                    background: on ? 'var(--color-background-secondary)' : 'transparent',
+                    border: on ? '0.5px solid var(--color-border-secondary)' : '0.5px solid var(--color-border-tertiary)',
+                    borderRadius:'var(--border-radius-md)', padding:'8px 10px', cursor:'pointer', width:'100%',
+                    transition:'all 0.15s',
+                  }}
+                >
+                  <div style={{ width:30, height:30, borderRadius:'var(--border-radius-md)', background: on ? '#eaf3de' : 'var(--color-background-secondary)', display:'flex', alignItems:'center', justifyContent:'center', flexShrink:0 }}>
+                    <i className={`ti ${device.icon}`} aria-hidden="true" style={{ fontSize:15, color: on ? '#3B6D11' : 'var(--color-text-secondary)' }} />
+                  </div>
+                  <div style={{ flex:1, minWidth:0 }}>
+                    <div style={{ fontSize:13, fontWeight:500, color:'var(--color-text-primary)' }}>{device.name}</div>
+                    <div style={{ fontSize:11, color:'var(--color-text-secondary)', fontFamily:'monospace', marginTop:1, whiteSpace:'nowrap', overflow:'hidden', textOverflow:'ellipsis' }}>{device.topic}</div>
+                  </div>
+                  <div style={{ display:'flex', flexDirection:'column', alignItems:'flex-end', gap:3, flexShrink:0 }}>
+                    <Badge variant={on ? 'good' : 'idle'} style={{ fontSize:10, padding:'2px 7px' }}>{on ? 'Publishing' : device.protocol}</Badge>
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+
+        {/* Live message log panel */}
+        <div style={panelStyle}>
+          <PanelHeader icon="ti-message-2" label="Live broker message log" colorClass={{ background:'#faeeda', color:'#854F0B' }} />
+          <div style={sectionLabel}>{messages.length ? `${messages.length} message${messages.length === 1 ? '' : 's'} received` : 'Waiting for messages…'}</div>
+          <div style={{ display:'flex', flexDirection:'column', gap:6, maxHeight:420, overflowY:'auto' }}>
+            {messages.length === 0 && (
+              <div style={{ ...cardStyle, textAlign:'center', color:'var(--color-text-secondary)', fontSize:12, padding:'1.5rem' }}>
+                Subscribe to a device on the left to see live publish events here.
+              </div>
+            )}
+            {messages.map(m => (
+              <div key={m.id} style={{ ...cardStyle, display:'flex', flexDirection:'column', gap:3 }}>
+                <div style={{ display:'flex', justifyContent:'space-between', alignItems:'baseline', gap:8 }}>
+                  <span style={{ fontSize:12, fontWeight:500, color:'var(--color-text-primary)' }}>{m.deviceName}</span>
+                  <span style={{ fontSize:10, color:'var(--color-text-secondary)', fontFamily:'monospace', flexShrink:0 }}>
+                    {new Date(m.ts).toLocaleTimeString([], { hour12:false })}
+                  </span>
+                </div>
+                <div style={{ fontSize:11, color:'var(--color-text-secondary)', fontFamily:'monospace' }}>{m.topic}</div>
+                <div style={{ fontSize:14, fontWeight:500, color:'#1a5fa8', fontFamily:'monospace' }}>{String(m.payload)}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+
+      {/* Compat footer */}
+      <div style={{ marginTop:'1rem', textAlign:'center', fontSize:12, color:'var(--color-text-secondary)', paddingTop:'0.75rem', borderTop:'0.5px solid var(--color-border-tertiary)' }}>
+        Simulated locally with <strong>setInterval</strong> publish loops · no real MQTT broker or network connection is used
+      </div>
+    </div>
+  );
+}
+
+
 const panelStyle = {
   background: 'var(--color-background-primary)',
   border: '0.5px solid var(--color-border-tertiary)',
