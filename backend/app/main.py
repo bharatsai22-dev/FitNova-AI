@@ -150,7 +150,6 @@ async def sync_google_user(user_data: GoogleAuthRequest):
             )
             return {"status": "success", "message": "Welcome back!", "user": existing_user}
         
-        # Added 'role': 'user' here to safely establish RBAC profiles
         new_user_document = {
             "email": user_data.email,
             "name": user_data.name,
