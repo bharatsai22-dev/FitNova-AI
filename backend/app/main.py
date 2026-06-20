@@ -22,10 +22,14 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# Shared CORS Configuration for your React UI
+# Shared CORS Configuration for your React UI (Updated for Production Validation)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"], 
+    allow_origins=[
+        "http://localhost:5173", 
+        "http://127.0.0.1:5173",
+        "https://dazzling-cocada-1a7c04.netlify.app"  # Your production Netlify deployment link
+    ], 
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
